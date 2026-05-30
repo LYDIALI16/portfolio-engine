@@ -1,9 +1,11 @@
 type,ticker,name,weight,tags
-持仓,NVDA,英伟达,0.32,AI;半导体
-持仓,NBIS,Nebius,0.06,AI;算力
-持仓,IBKR,盈透证券,0.02,金融
-持仓,V,Visa,0.02,金融;支付
+持仓,NVDA,英伟达,0.30,AI;半导体
+持仓,GOOG,谷歌,0.30,AI;互联网
+持仓,NBIS,Nebius,0.30,AI;算力
 持仓,NEE,NextEra Energy,0.05,公用事业
-候选,GEV,GE Vernova,0.0,电力;能源
+持仓,IBKR,盈透证券,0.02,金融
+候选,V,Visa,0.03,金融;支付
+候选,MU,美光,0.0,AI;半导体;存储
 候选,AVGO,Broadcom,0.0,AI;半导体
+候选,GEV,GE Vernova,0.0,电力;能源
 候选,DUOL,多邻国,0.0,软件;成长
