@@ -2,7 +2,9 @@
 持仓监控 Dashboard
 - 盘中实时报价（yfinance，带缓存，断网回退到 data/us/ 的 CSV）
 - 技术面打分 + 宏观因素 -> 加减仓信号标识（宏观权重低于个股，重大突破可压过宏观）
+- 风险预警标识（价格层面的烟雾报警器，不含新闻面）
 - 自动抓取的持仓大事件（财报 / 除息）及预计时间
+- 持仓清单从 config/holdings.csv 读取，可在网页直接编辑
 """
 import os
 import pandas as pd
@@ -17,6 +19,9 @@ MACRO_DIR = "data/macro"
 EVENTS_DIR = "data/events"
 CONFIG_FILE = "config/holdings.csv"
 
+# 用作个股“跑输板块”比较的基准（半导体板块）；data/us 里有则启用
+BENCHMARK_TICKER = "SOXX"
+
 
 # ---------------------------------------------------------------------------
 # 数据加载
@@ -28,7 +33,8 @@ def load_holdings() -> dict:
     holdings = {}
     for _, r in df.iterrows():
         raw_tags = str(r.get("tags", "") or "")
-        tags = [t.strip() for t in raw_tags.split(";") if t.strip() and t.strip().lower() != "nan"]
+        tags = [t.strip() for t in raw_tags.split(";")
+                if t.strip() and t.strip().lower() != "nan"]
         holdings[str(r["ticker"]).strip()] = {
             "name": str(r["name"]).strip(),
             "weight": float(r["weight"]),
@@ -90,6 +96,21 @@ def live_quotes(tickers: tuple) -> dict:
         return {}
 
 
+def days_to_next_earnings(events: pd.DataFrame, ticker: str):
+    """从事件表算该股距下次财报的天数；无数据返回 None。"""
+    if events is None or events.empty:
+        return None
+    today = pd.Timestamp.now().normalize()
+    sub = events[(events["ticker"] == ticker) & (events["type"] == "财报")].copy()
+    if sub.empty:
+        return None
+    sub["date"] = pd.to_datetime(sub["date"])
+    future = sub[sub["date"] >= today]
+    if future.empty:
+        return None
+    return int((future["date"].min() - today).days)
+
+
 try:
     HOLDINGS = load_holdings()
 except Exception as e:
@@ -117,6 +138,10 @@ events = load_events()
 quotes = live_quotes(tuple(HOLDINGS.keys())) if realtime else {}
 data_source = "🟢 盘中实时" if quotes else "🕒 每日收盘（CSV）"
 
+# 板块基准（用于个股“跑输板块”预警）
+benchmark = load_history(BENCHMARK_TICKER)
+benchmark_series = benchmark["Close"] if not benchmark.empty else None
+
 st.title("📈 持仓监控引擎")
 st.caption(f"数据来源：{data_source}　|　刷新于 {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
 
@@ -136,6 +161,44 @@ with m2:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# 全部分析（一次算好，供下面各区块复用）
+# ---------------------------------------------------------------------------
+analysis_cache = {}
+for ticker in HOLDINGS:
+    df = load_history(ticker)
+    if df.empty:
+        continue
+    dte = days_to_next_earnings(events, ticker)
+    analysis_cache[ticker] = analytics.analyze(
+        df, macro, benchmark=benchmark_series, days_to_earnings=dte
+    )
+
+# ---------------------------------------------------------------------------
+# 风险预警横幅：把命中 high 级预警的持仓置顶提醒
+# ---------------------------------------------------------------------------
+st.subheader("🚨 风险预警")
+alert_lines = []
+for ticker, info in HOLDINGS.items():
+    res = analysis_cache.get(ticker)
+    if not res:
+        continue
+    for a in res["alerts"]:
+        icon = "🔴" if a["level"] == "high" else "🟡"
+        alert_lines.append((a["level"], f"{icon} **{ticker} {info['name']}** ｜ {a['tag']}：{a['detail']}"))
+
+if alert_lines:
+    # high 级在前
+    alert_lines.sort(key=lambda x: 0 if x[0] == "high" else 1)
+    for _lvl, line in alert_lines:
+        st.markdown(line)
+    st.caption("⚠️ 这是**价格层面**的预警（量价/均线/波动/板块/财报日），不含新闻消息面。"
+               "请结合公司公告与新闻自行判断。")
+else:
+    st.success("当前无持仓触发价格层面风险预警。")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # 持仓总览 + 信号
 # ---------------------------------------------------------------------------
 total_weight = sum(h["weight"] for h in HOLDINGS.values())
@@ -144,14 +207,12 @@ c1.metric("已用美股仓位", f"{total_weight*100:.0f}%")
 c2.metric("现金仓位", f"{(1-total_weight)*100:.0f}%")
 c3.metric("跟踪股票数", len(HOLDINGS))
 
-analysis_cache = {}
 rows = []
 for ticker, info in HOLDINGS.items():
     df = load_history(ticker)
     if df.empty:
         continue
-    res = analytics.analyze(df, macro)
-    analysis_cache[ticker] = res
+    res = analysis_cache[ticker]
 
     csv_close = df["Close"].iloc[-1]
     price = quotes.get(ticker, csv_close)
@@ -159,9 +220,19 @@ for ticker, info in HOLDINGS.items():
     change_pct = (price - prev) / prev * 100
 
     sig = res["signal"]
+    # 预警汇总：有 high 显示 🔴，仅 warn 显示 🟡
+    levels = [a["level"] for a in res["alerts"]]
+    if "high" in levels:
+        warn_cell = "🔴 " + "/".join(a["tag"].split(" ")[-1] for a in res["alerts"])
+    elif levels:
+        warn_cell = "🟡 " + "/".join(a["tag"].split(" ")[-1] for a in res["alerts"])
+    else:
+        warn_cell = ""
+
     flag = "↑突破压过宏观" if sig["macro_overridden"] else ""
     rows.append({
         "信号": sig["label"],
+        "预警": warn_cell,
         "类型": info["type"],
         "代码": ticker,
         "名称": info["name"],
@@ -199,6 +270,15 @@ if not df.empty and selected in analysis_cache:
     top[1].metric("最新价", f"${price:.2f}")
     top[2].metric("52周高", f"${ind['high52']:.2f}", f"{ind['pct_from_high']:+.1f}%")
     top[3].metric("RSI(14)", f"{ind['rsi']:.0f}" if not pd.isna(ind['rsi']) else "—")
+
+    # 个股风险预警
+    if res["alerts"]:
+        for a in res["alerts"]:
+            msg = f"{a['tag']}：{a['detail']}"
+            if a["level"] == "high":
+                st.error(msg)
+            else:
+                st.warning(msg)
 
     left, right = st.columns([3, 2])
     with left:

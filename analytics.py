@@ -248,10 +248,69 @@ def combined_signal(tech: dict, macro: dict) -> dict:
     }
 
 
-def analyze(df: pd.DataFrame, macro: dict) -> dict:
-    """一站式：从行情+宏观得到完整分析结果。"""
+def analyze(df: pd.DataFrame, macro: dict, benchmark: pd.Series = None,
+            days_to_earnings: int = None) -> dict:
+    """一站式：从行情+宏观得到完整分析结果，并附带风险预警。"""
     ind = compute_indicators(df)
     tech = technical_score(ind)
     mac = macro_stance(macro)
     sig = combined_signal(tech, mac)
-    return {"indicators": ind, "technical": tech, "macro": mac, "signal": sig}
+    alerts = risk_alerts(df, ind, benchmark=benchmark, days_to_earnings=days_to_earnings)
+    return {"indicators": ind, "technical": tech, "macro": mac,
+            "signal": sig, "alerts": alerts}
+
+
+# ---------------------------------------------------------------------------
+# 风险预警：价格层面的“烟雾报警器”（不含新闻面）
+# ---------------------------------------------------------------------------
+def risk_alerts(df: pd.DataFrame, ind: dict, benchmark: pd.Series = None,
+                days_to_earnings: int = None) -> list:
+    """
+    返回命中的风险预警列表，每条 {level, tag, detail}。
+    level: 'high'(红) / 'warn'(黄)。数据缺失的规则自动跳过，不报错。
+    """
+    alerts = []
+    close = df["Close"].astype(float)
+
+    # 1) 放量下跌：量比≥2 且 当日跌幅≥4%
+    vr, dc = ind.get("vol_ratio", np.nan), ind.get("day_change_pct", np.nan)
+    if not np.isnan(vr) and not np.isnan(dc) and vr >= 2 and dc <= -4:
+        alerts.append({"level": "high", "tag": "📉 放量下跌",
+                       "detail": f"量比{vr:.1f}，当日{dc:.1f}%（疑似利空出货）"})
+
+    # 2) 跌破均线
+    price, s50, s200 = ind.get("price"), ind.get("sma50"), ind.get("sma200")
+    if price is not None and not np.isnan(s200) and price < s200:
+        alerts.append({"level": "high", "tag": "🔻 跌破200日",
+                       "detail": "价格跌破200日均线，长期趋势转弱"})
+    elif price is not None and not np.isnan(s50) and price < s50:
+        alerts.append({"level": "warn", "tag": "🔻 跌破50日",
+                       "detail": "价格跌破50日均线，中期走弱"})
+
+    # 3) 异常波动：当日波幅 > 自身20日日常波幅的 2.5 倍
+    daily_range = (df["High"].astype(float) - df["Low"].astype(float)) / close
+    if len(daily_range) >= 21:
+        today_range = float(daily_range.iloc[-1])
+        normal = float(daily_range.iloc[-21:-1].mean())
+        if normal > 0 and today_range > normal * 2.5:
+            alerts.append({"level": "warn", "tag": "⚡ 异常波动",
+                           "detail": f"当日振幅{today_range*100:.1f}%，达日常的{today_range/normal:.1f}倍"})
+
+    # 4) 跑输板块：近5日相对基准(SOXX等)跑输≥8%
+    if benchmark is not None and len(benchmark.dropna()) > 5 and len(close) > 5:
+        try:
+            stock_ret = close.iloc[-1] / close.iloc[-6] - 1
+            bench_ret = benchmark.dropna().iloc[-1] / benchmark.dropna().iloc[-6] - 1
+            diff = (stock_ret - bench_ret) * 100
+            if diff <= -8:
+                alerts.append({"level": "high", "tag": "📊 跑输板块",
+                               "detail": f"近5日相对板块跑输{diff:.1f}%（疑似个股利空）"})
+        except Exception:
+            pass
+
+    # 5) 财报临近：未来7天内
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 7:
+        alerts.append({"level": "warn", "tag": "🗓️ 财报临近",
+                       "detail": f"{days_to_earnings}天后财报，高波动雷区"})
+
+    return alerts
