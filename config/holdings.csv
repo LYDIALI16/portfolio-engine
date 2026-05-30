@@ -8,4 +8,4 @@ type,ticker,name,weight,tags
 候选,GEV,GE Vernova,0.0,电力;能源
 候选,AVGO,Broadcom,0.0,AI;半导体
 候选,DUOL,多邻国,0.0,软件;成长
-候选,MU,美光,0.0,AI,半导体
+候选,MU,美光,0.0,AI;半导体
