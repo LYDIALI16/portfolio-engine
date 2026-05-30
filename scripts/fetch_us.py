@@ -7,16 +7,12 @@ import pandas as pd
 import os
 from datetime import datetime
 
-TICKERS = {
-    "NVDA": "英伟达",
-    "NBIS": "Nebius",
-    "IBKR": "盈透证券",
-    "V": "Visa",
-    "NEE": "NextEra Energy",
-    "GEV": "GE Vernova",
-    "AVGO": "Broadcom",
-    "DUOL": "多邻国",
-}
+# 持仓/候选清单从 config/holdings.csv 读取（与 dashboard 共用同一份配置）
+_cfg = pd.read_csv("config/holdings.csv")
+TICKERS = dict(zip(
+    _cfg["ticker"].astype(str).str.strip(),
+    _cfg["name"].astype(str).str.strip(),
+))
 
 # 宏观指标：文件名 -> yfinance 代码
 MACRO = {

@@ -12,26 +12,32 @@ import analytics
 
 st.set_page_config(page_title="持仓监控", page_icon="📈", layout="wide")
 
-# 持仓信息（暂时硬编码，下个里程碑抽到 config.yaml）
-HOLDINGS = {
-    "NVDA": {"name": "英伟达", "weight": 0.32, "type": "持仓"},
-    "NBIS": {"name": "Nebius", "weight": 0.06, "type": "持仓"},
-    "IBKR": {"name": "盈透证券", "weight": 0.02, "type": "持仓"},
-    "V": {"name": "Visa", "weight": 0.02, "type": "持仓"},
-    "NEE": {"name": "NextEra Energy", "weight": 0.05, "type": "持仓"},
-    "GEV": {"name": "GE Vernova", "weight": 0.0, "type": "候选"},
-    "AVGO": {"name": "Broadcom", "weight": 0.0, "type": "候选"},
-    "DUOL": {"name": "多邻国", "weight": 0.0, "type": "候选"},
-}
-
 US_DIR = "data/us"
 MACRO_DIR = "data/macro"
 EVENTS_DIR = "data/events"
+CONFIG_FILE = "config/holdings.csv"
 
 
 # ---------------------------------------------------------------------------
 # 数据加载
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=600)
+def load_holdings() -> dict:
+    """从 config/holdings.csv 读取持仓/候选清单，支持网页直接编辑。"""
+    df = pd.read_csv(CONFIG_FILE)
+    holdings = {}
+    for _, r in df.iterrows():
+        raw_tags = str(r.get("tags", "") or "")
+        tags = [t.strip() for t in raw_tags.split(";") if t.strip() and t.strip().lower() != "nan"]
+        holdings[str(r["ticker"]).strip()] = {
+            "name": str(r["name"]).strip(),
+            "weight": float(r["weight"]),
+            "type": str(r["type"]).strip(),
+            "tags": tags,
+        }
+    return holdings
+
+
 @st.cache_data(ttl=3600)
 def load_history(ticker: str) -> pd.DataFrame:
     path = f"{US_DIR}/{ticker}.csv"
@@ -83,6 +89,12 @@ def live_quotes(tickers: tuple) -> dict:
     except Exception:
         return {}
 
+
+try:
+    HOLDINGS = load_holdings()
+except Exception as e:
+    st.error(f"读取持仓配置 {CONFIG_FILE} 失败：{e}")
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # 侧边栏：实时刷新控制
