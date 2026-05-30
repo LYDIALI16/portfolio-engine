@@ -1,6 +1,6 @@
 type,ticker,name,weight,tags
 持仓,NVDA,英伟达,0.30,AI;半导体
-持仓,GOOL,谷歌，0.30,AI+云+广告
+持仓,GOOL,谷歌,0.30,AI+云+广告
 持仓,NBIS,Nebius,0.30,AI;算力
 持仓,IBKR,盈透证券,0.02,金融
 持仓,V,Visa,0.3,金融;支付
