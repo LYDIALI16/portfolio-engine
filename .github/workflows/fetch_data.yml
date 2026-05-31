@@ -29,5 +29,11 @@ jobs:
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
           git add data/
-          git diff --staged --quiet || git commit -m "数据更新 $(date +'%Y-%m-%d')"
-          git push
+          git diff --staged --quiet && echo "无数据变化，跳过" && exit 0
+          git commit -m "数据更新 $(date +'%Y-%m-%d')"
+          # push 前先同步远端，避免与其它提交撞车导致 rejected；失败则重试几次
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin main && git push origin main && exit 0
+            echo "第 $i 次 push 失败，重试..." && sleep 5
+          done
+          echo "push 多次失败" && exit 1
