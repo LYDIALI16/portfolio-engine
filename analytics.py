@@ -141,11 +141,16 @@ def technical_score(ind: dict) -> dict:
 # ---------------------------------------------------------------------------
 def macro_stance(macro: dict) -> dict:
     """
-    macro: {"TNX": series, "VIX": series, "DXY": series, ...}（可缺失）
-    返回宏观分 (-100~+100，正=顺风) 与理由。宏观分会被赋予较低权重。
+    macro: {"TNX": series, "VIX": series, "SOXX": series, "HYG": series,
+            "DXY": series, "IRX": series, ...}（可缺失）
+    返回宏观分 (-100~+100，正=顺风)、理由、以及每项指标的当前读数 metrics。
+
+    计分项（贴合 AI/成长组合）：TNX(利率)、VIX(恐慌)、SOXX(半导体动能)、HYG(信用利差)。
+    仅参考显示（不计分）：10年-3月收益率曲线、美元指数。
     """
     score = 0
     reasons = []
+    metrics = []   # 每项 {name, value, note}，无论是否计分都列出，解决"信息太少"
     tightening = False
 
     def trend(series, lookback=20):
@@ -154,49 +159,110 @@ def macro_stance(macro: dict) -> dict:
             return np.nan
         return float(s.iloc[-1] - s.iloc[-1 - lookback])
 
-    # 10年期美债收益率：上行=利率收紧=逆风
+    def pct_trend(series, lookback=20):
+        s = series.dropna()
+        if len(s) <= lookback:
+            return np.nan
+        return float(s.iloc[-1] / s.iloc[-1 - lookback] - 1) * 100
+
+    def last_val(series):
+        s = series.dropna()
+        return float(s.iloc[-1]) if len(s) else np.nan
+
+    # --- 计分项 1：10年期美债收益率（高估值成长股的头号因子）---
     tnx = macro.get("TNX")
     if tnx is not None and len(tnx.dropna()):
-        d = trend(tnx)
+        v, d = last_val(tnx), trend(tnx)
+        note = "窄幅波动"
         if not np.isnan(d):
             if d > 0.15:
                 score -= 25
                 tightening = True
-                reasons.append(f"🔺 10年期美债收益率近月上行{d:.2f}%（利率收紧）")
+                note = f"近月上行{d:.2f}%（利率收紧，压制成长股）"
+                reasons.append(f"🔺 10年期美债收益率{note}")
             elif d < -0.15:
                 score += 20
-                reasons.append(f"🔻 10年期美债收益率近月下行{abs(d):.2f}%（利率宽松）")
-            else:
-                reasons.append("10年期美债收益率窄幅波动")
+                note = f"近月下行{abs(d):.2f}%（利率宽松，利好成长股）"
+                reasons.append(f"🔻 10年期美债收益率{note}")
+        metrics.append({"name": "10年期美债收益率", "value": f"{v:.2f}%", "note": note})
 
-    # VIX：恐慌指数
+    # --- 计分项 2：VIX 恐慌指数 ---
     vix = macro.get("VIX")
     if vix is not None and len(vix.dropna()):
-        v = float(vix.dropna().iloc[-1])
+        v = last_val(vix)
         if v >= 30:
             score -= 20
-            reasons.append(f"VIX={v:.0f} 市场恐慌")
+            note = "市场恐慌"
+            reasons.append(f"VIX={v:.0f} {note}")
         elif v >= 20:
             score -= 8
-            reasons.append(f"VIX={v:.0f} 波动偏高")
+            note = "波动偏高"
+            reasons.append(f"VIX={v:.0f} {note}")
         elif v < 15:
             score += 10
-            reasons.append(f"VIX={v:.0f} 情绪平稳")
+            note = "情绪平稳"
+            reasons.append(f"VIX={v:.0f} {note}")
+        else:
+            note = "中性"
+        metrics.append({"name": "VIX 恐慌指数", "value": f"{v:.1f}", "note": note})
 
-    # 美元指数：走强对美股偏逆风
+    # --- 计分项 3：半导体板块 SOXX（你 90% 押 AI，板块动能是命脉）---
+    soxx = macro.get("SOXX")
+    if soxx is not None and len(soxx.dropna()):
+        v, d = last_val(soxx), pct_trend(soxx)
+        note = "横盘"
+        if not np.isnan(d):
+            if d > 5:
+                score += 22
+                note = f"近月+{d:.1f}%（半导体强势）"
+                reasons.append(f"🚀 半导体板块{note}")
+            elif d > 1:
+                score += 8
+                note = f"近月+{d:.1f}%（偏强）"
+            elif d < -5:
+                score -= 22
+                note = f"近月{d:.1f}%（半导体走弱，警惕）"
+                reasons.append(f"📉 半导体板块{note}")
+            elif d < -1:
+                score -= 8
+                note = f"近月{d:.1f}%（偏弱）"
+        metrics.append({"name": "半导体板块 SOXX", "value": f"{v:.1f}", "note": note})
+
+    # --- 计分项 4：信用利差 HYG（高收益债，风险偏好温度计）---
+    hyg = macro.get("HYG")
+    if hyg is not None and len(hyg.dropna()):
+        v, d = last_val(hyg), pct_trend(hyg)
+        note = "平稳"
+        if not np.isnan(d):
+            # HYG 下跌=利差走阔=机构避险=逆风
+            if d < -2:
+                score -= 15
+                note = f"近月{d:.1f}%（信用利差走阔，风险偏好恶化）"
+                reasons.append(f"⚠️ 信用市场{note}")
+            elif d > 2:
+                score += 8
+                note = f"近月+{d:.1f}%（风险偏好回暖）"
+        metrics.append({"name": "信用利差 HYG", "value": f"{v:.1f}", "note": note})
+
+    # --- 参考项 A：收益率曲线 10年-3月（美联储看重的衰退指标，不计分）---
+    if tnx is not None and macro.get("IRX") is not None:
+        t10, t3m = last_val(tnx), last_val(macro["IRX"])
+        if not np.isnan(t10) and not np.isnan(t3m):
+            spread = t10 - t3m
+            note = f"{spread:+.2f}%（{'倒挂⚠️衰退预警' if spread < 0 else '正常'}）"
+            metrics.append({"name": "收益率曲线(10年-3月)", "value": f"{spread:+.2f}%", "note": note})
+
+    # --- 参考项 B：美元指数（不计分，仅显示）---
     dxy = macro.get("DXY")
     if dxy is not None and len(dxy.dropna()):
-        d = trend(dxy)
-        if not np.isnan(d):
-            if d > 1.5:
-                score -= 8
-                reasons.append("美元指数走强")
-            elif d < -1.5:
-                score += 6
-                reasons.append("美元指数走弱")
+        v, d = last_val(dxy), trend(dxy)
+        note = "走强（偏逆风）" if (not np.isnan(d) and d > 1.5) else \
+               ("走弱（偏顺风）" if (not np.isnan(d) and d < -1.5) else "窄幅波动")
+        metrics.append({"name": "美元指数 DXY", "value": f"{v:.1f}", "note": note})
 
     score = int(max(-100, min(100, score)))
-    return {"score": score, "reasons": reasons, "tightening": tightening}
+    return {"score": score, "reasons": reasons, "tightening": tightening,
+            "metrics": metrics}
 
 
 # ---------------------------------------------------------------------------

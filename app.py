@@ -19,8 +19,8 @@ MACRO_DIR = "data/macro"
 EVENTS_DIR = "data/events"
 CONFIG_FILE = "config/holdings.csv"
 
-# 用作个股“跑输板块”比较的基准（半导体板块）；data/us 里有则启用
-BENCHMARK_TICKER = "SOXX"
+# 用作个股“跑输板块”比较的基准（半导体板块），从宏观数据 data/macro/SOXX.csv 取
+BENCHMARK_KEY = "SOXX"
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +138,8 @@ events = load_events()
 quotes = live_quotes(tuple(HOLDINGS.keys())) if realtime else {}
 data_source = "🟢 盘中实时" if quotes else "🕒 每日收盘（CSV）"
 
-# 板块基准（用于个股“跑输板块”预警）
-benchmark = load_history(BENCHMARK_TICKER)
-benchmark_series = benchmark["Close"] if not benchmark.empty else None
+# 板块基准（用于个股“跑输板块”预警）：从宏观数据里取 SOXX
+benchmark_series = macro.get(BENCHMARK_KEY)
 
 st.title("📈 持仓监控引擎")
 st.caption(f"数据来源：{data_source}　|　刷新于 {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
@@ -152,11 +151,18 @@ m1.metric("宏观环境", "逆风 🔻" if mac["score"] < 0 else ("顺风 🔺" 
           f"{mac['score']:+d} 分（权重 {analytics.MACRO_WEIGHT}）")
 with m2:
     if mac["reasons"]:
-        st.write("**宏观因素：** " + "　·　".join(mac["reasons"]))
-    else:
+        st.write("**关键信号：** " + "　·　".join(mac["reasons"]))
+    elif not mac.get("metrics"):
         st.write("**宏观因素：** 暂无宏观数据（运行 fetch_us.py 后生成 data/macro/）")
     if mac["tightening"]:
         st.caption("⚠️ 当前利率收紧。注意：个股若有重大突破，信号仍可锁定在“加仓”。")
+
+# 宏观指标明细：每项当前读数都列出（计分 4 项 + 参考 2 项）
+if mac.get("metrics"):
+    mdf = pd.DataFrame(mac["metrics"]).rename(
+        columns={"name": "指标", "value": "当前值", "note": "解读"})
+    st.dataframe(mdf, use_container_width=True, hide_index=True)
+    st.caption("计分项：10年期美债收益率·VIX·半导体SOXX·信用利差HYG ｜ 参考项（不计分）：收益率曲线·美元指数")
 
 st.divider()
 
