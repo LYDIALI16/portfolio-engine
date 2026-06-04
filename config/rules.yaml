@@ -1,0 +1,60 @@
+# 规则引擎阈值参数 —— 全部可调，改完 dashboard 自动生效
+global:
+  confirm_days_trend_break: 2     # 趋势破坏确认天数（防假跌破）
+  min_trade_pct: 1                # 调整量 <1% 不动作（百分点；100万预算下约1万，更小的单不值得操作）
+  max_actions_per_day: 3          # 每日最大动作数
+  risk_per_trade: 0.005           # 单次风险预算（组合 0.5%）
+  initial_stop_atr_mult: 2.0      # 初始止损 = close - 2×ATR
+  chandelier_n: 22                # 吊灯止损回看天数
+  chandelier_atr_mult: 3.0        # 吊灯止损 ATR 倍数
+  structure_buffer_atr_mult: 1.0  # 结构位下方 ATR 缓冲
+
+env:                              # Layer 1 宏观威胁扫描
+  us10y_up_bp_10d: 20             # 10年期 10日上行 ≥20bp = 利率冲击
+  dxy_up_pct_10d: 1.5             # 美元 10日涨 ≥1.5% = 美元压力
+  vix_panic: 30                   # VIX ≥30 = 恐慌
+  vix_ma_days: 60                 # VIX 与其 N 日均线比较
+  macro_factor:                   # ENV → 加仓倍率
+    SUPPORTIVE: 1.0
+    NEUTRAL: 0.8
+    PRESSURE: 0.5
+
+risk_class:                       # 按波动类别的参数
+  HIGH:
+    gap_fill: 0.33                # 加仓填补"目标-当前"缺口的比例（高波动慢加）
+    trim_step: 0.30              # 减仓幅度=当前仓位×此比例
+    dd_red: 0.18                  # 60日回撤≥18% = RED
+    dd_amber: 0.10
+    overheat_rsi: 75              # RSI≥75 禁止追涨
+    atr_pct_red: 0.85            # ATR%历史分位≥0.85 = RED
+    atr_pct_amber: 0.70
+    pullback_atr_mult: 1.2        # 回调≤1.2×ATR 算"趋势内回调"
+    pullback_ma: MA50
+  MEDIUM:
+    gap_fill: 0.50
+    trim_step: 0.30
+    dd_red: 0.15
+    dd_amber: 0.10
+    overheat_rsi: 78
+    atr_pct_red: 0.85
+    atr_pct_amber: 0.70
+    pullback_atr_mult: 1.5
+    pullback_ma: MA50
+  LOW:
+    gap_fill: 0.67
+    trim_step: 0.25
+    dd_red: 0.12
+    dd_amber: 0.08
+    overheat_rsi: 80
+    atr_pct_red: 0.90
+    atr_pct_amber: 0.75
+    pullback_atr_mult: 1.0
+    pullback_ma: MA20
+
+reentry_ladder: [15, 25, 35]      # 再入场分级目标（占 target_max 的%）
+
+crowding:                         # 拥挤度（防追高）
+  lookback: 20
+  return_percentile_high: 0.80
+  volume_ratio_high: 1.8
+  volume_ratio_medium: 1.3
