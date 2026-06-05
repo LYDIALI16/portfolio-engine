@@ -1,52 +1,81 @@
 """
-持仓监控 Dashboard
-- 盘中实时报价（yfinance，带缓存，断网回退到 data/us/ 的 CSV）
-- 技术面打分 + 宏观因素 -> 加减仓信号标识（宏观权重低于个股，重大突破可压过宏观）
-- 风险预警标识（价格层面的烟雾报警器，不含新闻面）
-- 自动抓取的持仓大事件（财报 / 除息）及预计时间
-- 持仓清单从 config/holdings.csv 读取，可在网页直接编辑
+持仓监控 Dashboard v2 —— 规则引擎驱动（三层闸门 ENV→Trend→Trigger）
+- 每只股票输出明确动作（ADD/TRIM/EXIT/REENTRY/HOLD/NO_ACTION/WATCH）+ 可解释理由
+- 盘中实时报价（yfinance，带缓存，断网回退 CSV）
+- 持仓配置 config/portfolio.csv（含成本价、目标仓位、角色、风险类别）
+- 阈值参数 config/rules.yaml 可调
 """
 import os
+import yaml
 import pandas as pd
 import streamlit as st
 
-import analytics
+import indicators
+import engine
 
-st.set_page_config(page_title="持仓监控", page_icon="📈", layout="wide")
+st.set_page_config(page_title="持仓监控引擎", page_icon="📈", layout="wide")
 
 US_DIR = "data/us"
+CN_DIR = "data/cn"
 MACRO_DIR = "data/macro"
 EVENTS_DIR = "data/events"
-CONFIG_FILE = "config/holdings.csv"
+PORTFOLIO_FILE = "config/portfolio.csv"
+RULES_FILE = "config/rules.yaml"
+BENCHMARK_KEY = "SOXX"   # 个股相对强弱基准（半导体板块）
 
-# 用作个股“跑输板块”比较的基准（半导体板块），从宏观数据 data/macro/SOXX.csv 取
-BENCHMARK_KEY = "SOXX"
+ACTION_STYLE = {
+    "ADD":      ("🟢 加仓", "#1a7f37"),
+    "REENTRY":  ("🟢 接回", "#1a7f37"),
+    "HOLD":     ("🔵 持有", "#0969da"),
+    "WATCH":    ("🟡 观望", "#9a6700"),
+    "TRIM":     ("🟠 减仓", "#bc4c00"),
+    "EXIT":     ("🔴 清出", "#cf222e"),
+    "NO_ACTION":("⚪ 不动", "#57606a"),
+}
+TREND_CN = {
+    "UP_TREND": "上升", "UP_PULLBACK": "上升回调", "SIDEWAYS": "横盘",
+    "DOWN_TRANSITION": "转弱", "DOWN_TREND": "下降",
+}
 
 
 # ---------------------------------------------------------------------------
 # 数据加载
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600)
-def load_holdings() -> dict:
-    """从 config/holdings.csv 读取持仓/候选清单，支持网页直接编辑。"""
-    df = pd.read_csv(CONFIG_FILE)
-    holdings = {}
+def load_rules() -> dict:
+    return yaml.safe_load(open(RULES_FILE, encoding="utf-8"))
+
+
+@st.cache_data(ttl=600)
+def load_portfolio() -> list:
+    """读取 config/portfolio.csv，返回 holding dict 列表。容错 role 拼写。"""
+    df = pd.read_csv(PORTFOLIO_FILE)
+    roles = {"CORE", "SATELLITE", "WATCHLIST"}
+    out = []
     for _, r in df.iterrows():
-        raw_tags = str(r.get("tags", "") or "")
-        tags = [t.strip() for t in raw_tags.split(";")
-                if t.strip() and t.strip().lower() != "nan"]
-        holdings[str(r["ticker"]).strip()] = {
+        if not bool(r.get("enabled", True)):
+            continue
+        role = str(r["role"]).strip().upper()
+        if role not in roles:  # 容错：ATELLITE -> SATELLITE 等
+            role = "SATELLITE" if "ATEL" in role else ("WATCHLIST" if "WATCH" in role else "CORE")
+        out.append({
+            "market": str(r["market"]).strip().upper(),
+            "symbol": str(r["symbol"]).strip(),
             "name": str(r["name"]).strip(),
-            "weight": float(r["weight"]),
-            "type": str(r["type"]).strip(),
-            "tags": tags,
-        }
-    return holdings
+            "current_weight": float(r["current_weight"]),
+            "cost_basis": float(r.get("cost_basis", 0) or 0),
+            "target_max_weight": float(r["target_max_weight"]),
+            "role": role,
+            "risk_class": str(r["risk_class"]).strip().upper(),
+            "allow_add": bool(r.get("allow_add", True)),
+        })
+    return out
 
 
 @st.cache_data(ttl=3600)
-def load_history(ticker: str) -> pd.DataFrame:
-    path = f"{US_DIR}/{ticker}.csv"
+def load_history(market: str, symbol: str) -> pd.DataFrame:
+    d = CN_DIR if market == "CN" else US_DIR
+    path = f"{d}/{symbol}.csv"
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_csv(path, index_col=0, parse_dates=True)
@@ -59,9 +88,8 @@ def load_macro() -> dict:
         return out
     for fname in os.listdir(MACRO_DIR):
         if fname.endswith(".csv"):
-            key = fname[:-4]
             df = pd.read_csv(f"{MACRO_DIR}/{fname}", index_col=0, parse_dates=True)
-            out[key] = df["Close"]
+            out[fname[:-4]] = df["Close"]
     return out
 
 
@@ -74,21 +102,18 @@ def load_events() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def live_quotes(tickers: tuple) -> dict:
-    """盘中实时报价；带 60 秒缓存，断网/失败时返回空，让调用方回退 CSV。"""
+def live_quotes(symbols: tuple) -> dict:
+    """美股盘中实时报价；失败返回空，回退 CSV。A股不走实时。"""
     try:
         import yfinance as yf
-
-        data = yf.download(
-            tickers=list(tickers), period="2d", interval="1m",
-            group_by="ticker", progress=False, auto_adjust=True,
-        )
+        data = yf.download(tickers=list(symbols), period="2d", interval="1m",
+                           group_by="ticker", progress=False, auto_adjust=True)
         out = {}
-        for t in tickers:
+        for t in symbols:
             try:
-                close = data[t]["Close"].dropna()
-                if len(close):
-                    out[t] = float(close.iloc[-1])
+                c = data[t]["Close"].dropna()
+                if len(c):
+                    out[t] = float(c.iloc[-1])
             except Exception:
                 pass
         return out
@@ -96,211 +121,161 @@ def live_quotes(tickers: tuple) -> dict:
         return {}
 
 
-def days_to_next_earnings(events: pd.DataFrame, ticker: str):
-    """从事件表算该股距下次财报的天数；无数据返回 None。"""
-    if events is None or events.empty:
-        return None
-    today = pd.Timestamp.now().normalize()
-    sub = events[(events["ticker"] == ticker) & (events["type"] == "财报")].copy()
-    if sub.empty:
-        return None
-    sub["date"] = pd.to_datetime(sub["date"])
-    future = sub[sub["date"] >= today]
-    if future.empty:
-        return None
-    return int((future["date"].min() - today).days)
-
-
+# ---------------------------------------------------------------------------
+# 载入
+# ---------------------------------------------------------------------------
 try:
-    HOLDINGS = load_holdings()
+    RULES = load_rules()
+    HOLDINGS = load_portfolio()
 except Exception as e:
-    st.error(f"读取持仓配置 {CONFIG_FILE} 失败：{e}")
+    st.error(f"读取配置失败：{e}")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# 侧边栏：实时刷新控制
-# ---------------------------------------------------------------------------
+macro = load_macro()
+events = load_events()
+benchmark = macro.get(BENCHMARK_KEY)
+
+# 侧边栏
 st.sidebar.header("⚙️ 设置")
-realtime = st.sidebar.toggle("盘中实时报价", value=True,
-                             help="开启后用 yfinance 拉盘中价；断网自动回退到每日 CSV")
+realtime = st.sidebar.toggle("美股盘中实时报价", value=True)
 auto = st.sidebar.toggle("页面自动刷新", value=True)
 interval = st.sidebar.select_slider("刷新间隔（秒）", options=[30, 60, 120, 300], value=60)
-
 if auto:
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=interval * 1000, key="refresh")
     except Exception:
-        st.sidebar.caption("（未安装 streamlit-autorefresh，自动刷新不可用）")
+        st.sidebar.caption("（未安装 streamlit-autorefresh）")
 
-macro = load_macro()
-events = load_events()
-quotes = live_quotes(tuple(HOLDINGS.keys())) if realtime else {}
-data_source = "🟢 盘中实时" if quotes else "🕒 每日收盘（CSV）"
+us_symbols = tuple(h["symbol"] for h in HOLDINGS if h["market"] == "US")
+quotes = live_quotes(us_symbols) if realtime else {}
 
-# 板块基准（用于个股“跑输板块”预警）：从宏观数据里取 SOXX
-benchmark_series = macro.get(BENCHMARK_KEY)
+# ---------------------------------------------------------------------------
+# 跑引擎（全持仓）
+# ---------------------------------------------------------------------------
+env_info = engine.env_scan(macro, RULES)
+results = {}
+for h in HOLDINGS:
+    df = load_history(h["market"], h["symbol"])
+    if df.empty:
+        continue
+    ind = indicators.compute(df, benchmark=benchmark)
+    res = engine.analyze_holding(ind, h, macro, RULES, env_info)
+    # 价格 / 盈亏
+    csv_close = float(df["Close"].iloc[-1])
+    price = quotes.get(h["symbol"], csv_close)
+    res["price"] = price
+    res["pl_pct"] = ((price / h["cost_basis"] - 1) * 100) if h["cost_basis"] > 0 else None
+    res["name"] = h["name"]
+    res["ind"] = ind
+    results[h["symbol"]] = res
 
+data_source = "🟢 盘中实时" if quotes else "🕒 每日收盘"
 st.title("📈 持仓监控引擎")
-st.caption(f"数据来源：{data_source}　|　刷新于 {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
+st.caption(f"数据：{data_source}　|　{pd.Timestamp.now():%Y-%m-%d %H:%M:%S}　|　规则引擎 v1")
 
-# 宏观面板
-mac = analytics.macro_stance(macro)
-m1, m2 = st.columns([1, 3])
-m1.metric("宏观环境", "逆风 🔻" if mac["score"] < 0 else ("顺风 🔺" if mac["score"] > 0 else "中性"),
-          f"{mac['score']:+d} 分（权重 {analytics.MACRO_WEIGHT}）")
-with m2:
-    if mac["reasons"]:
-        st.write("**关键信号：** " + "　·　".join(mac["reasons"]))
-    elif not mac.get("metrics"):
-        st.write("**宏观因素：** 暂无宏观数据（运行 fetch_us.py 后生成 data/macro/）")
-    if mac["tightening"]:
-        st.caption("⚠️ 当前利率收紧。注意：个股若有重大突破，信号仍可锁定在“加仓”。")
-
-# 宏观指标明细：每项当前读数都列出（计分 4 项 + 参考 2 项）
-if mac.get("metrics"):
-    mdf = pd.DataFrame(mac["metrics"]).rename(
-        columns={"name": "指标", "value": "当前值", "note": "解读"})
-    st.dataframe(mdf, use_container_width=True, hide_index=True)
-    st.caption("计分项：10年期美债收益率·VIX·半导体SOXX·信用利差HYG ｜ 参考项（不计分）：收益率曲线·美元指数")
+# ---------------------------------------------------------------------------
+# 顶部：ENV 宏观闸门
+# ---------------------------------------------------------------------------
+env_label = {"SUPPORTIVE": "🟢 顺风", "NEUTRAL": "🟡 中性", "PRESSURE": "🔴 承压"}[env_info["env"]]
+e1, e2 = st.columns([1, 3])
+e1.metric("宏观环境 ENV", env_label, f"加仓倍率 ×{env_info['macro_factor']}")
+with e2:
+    st.write("**威胁扫描：** " + "　·　".join(env_info["reasons"]))
+    st.caption("ENV 只做闸门：决定能不能加、加仓打几折。不参与选股、不决定方向。"
+               + ("　⚠️ 承压：禁止高波动成长股加仓。" if env_info["env"] == "PRESSURE" else ""))
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 全部分析（一次算好，供下面各区块复用）
+# 今日必须动作（非 HOLD/NO_ACTION 的）
 # ---------------------------------------------------------------------------
-analysis_cache = {}
-for ticker in HOLDINGS:
-    df = load_history(ticker)
-    if df.empty:
-        continue
-    dte = days_to_next_earnings(events, ticker)
-    analysis_cache[ticker] = analytics.analyze(
-        df, macro, benchmark=benchmark_series, days_to_earnings=dte
-    )
-
-# ---------------------------------------------------------------------------
-# 风险预警横幅：把命中 high 级预警的持仓置顶提醒
-# ---------------------------------------------------------------------------
-st.subheader("🚨 风险预警")
-alert_lines = []
-for ticker, info in HOLDINGS.items():
-    res = analysis_cache.get(ticker)
-    if not res:
-        continue
-    for a in res["alerts"]:
-        icon = "🔴" if a["level"] == "high" else "🟡"
-        alert_lines.append((a["level"], f"{icon} **{ticker} {info['name']}** ｜ {a['tag']}：{a['detail']}"))
-
-if alert_lines:
-    # high 级在前
-    alert_lines.sort(key=lambda x: 0 if x[0] == "high" else 1)
-    for _lvl, line in alert_lines:
-        st.markdown(line)
-    st.caption("⚠️ 这是**价格层面**的预警（量价/均线/波动/板块/财报日），不含新闻消息面。"
-               "请结合公司公告与新闻自行判断。")
+st.subheader("📋 今日操作清单")
+actionable = [r for r in results.values() if r["action"] in ("ADD", "REENTRY", "TRIM", "EXIT")]
+order = {"EXIT": 0, "TRIM": 1, "REENTRY": 2, "ADD": 3}
+actionable.sort(key=lambda r: order.get(r["action"], 9))
+if actionable:
+    for r in actionable:
+        label, color = ACTION_STYLE[r["action"]]
+        sign = "+" if r["trade_pct"] > 0 else ""
+        st.markdown(
+            f"<span style='color:{color};font-weight:700'>{label}</span> "
+            f"**{r['symbol']} {r['name']}** "
+            f"（{r['size_hint']} {sign}{r['trade_pct']:.1f}%，当前{r['current_weight']:.0f}%→目标{r['target_pct']:.0f}%）"
+            f"　·　{r['rationale'][0] if r['rationale'] else ''}",
+            unsafe_allow_html=True)
 else:
-    st.success("当前无持仓触发价格层面风险预警。")
+    st.success("今日无必须操作（全部 HOLD / 观望）。")
+st.caption("⚠️ 这是基于价格/趋势/宏观的**机械建议**，不含新闻与基本面，仅供参考，最终决策在你。")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 持仓总览 + 信号
+# 持仓总览表
 # ---------------------------------------------------------------------------
-total_weight = sum(h["weight"] for h in HOLDINGS.values())
-c1, c2, c3 = st.columns(3)
-c1.metric("已用美股仓位", f"{total_weight*100:.0f}%")
-c2.metric("现金仓位", f"{(1-total_weight)*100:.0f}%")
-c3.metric("跟踪股票数", len(HOLDINGS))
-
+st.subheader("持仓总览")
 rows = []
-for ticker, info in HOLDINGS.items():
-    df = load_history(ticker)
-    if df.empty:
+for h in HOLDINGS:
+    r = results.get(h["symbol"])
+    if not r:
+        rows.append({"市场": h["market"], "代码": h["symbol"], "名称": h["name"],
+                     "角色": h["role"], "建议": "—(无数据)", "当前%": h["current_weight"]})
         continue
-    res = analysis_cache[ticker]
-
-    csv_close = df["Close"].iloc[-1]
-    price = quotes.get(ticker, csv_close)
-    prev = df["Close"].iloc[-2] if len(df) > 1 else csv_close
-    change_pct = (price - prev) / prev * 100
-
-    sig = res["signal"]
-    # 预警汇总：有 high 显示 🔴，仅 warn 显示 🟡
-    levels = [a["level"] for a in res["alerts"]]
-    if "high" in levels:
-        warn_cell = "🔴 " + "/".join(a["tag"].split(" ")[-1] for a in res["alerts"])
-    elif levels:
-        warn_cell = "🟡 " + "/".join(a["tag"].split(" ")[-1] for a in res["alerts"])
-    else:
-        warn_cell = ""
-
-    flag = "↑突破压过宏观" if sig["macro_overridden"] else ""
+    label = ACTION_STYLE[r["action"]][0]
+    sign = "+" if r["trade_pct"] > 0 else ""
     rows.append({
-        "信号": sig["label"],
-        "预警": warn_cell,
-        "类型": info["type"],
-        "代码": ticker,
-        "名称": info["name"],
-        "仓位": f"{info['weight']*100:.0f}%",
-        "最新价": f"{price:.2f}",
-        "涨跌": f"{change_pct:+.2f}%",
-        "技术分": sig["tech_score"],
-        "宏观分": sig["macro_score"],
-        "综合分": sig["combined"],
-        "备注": flag,
+        "市场": h["market"], "代码": h["symbol"], "名称": h["name"], "角色": h["role"],
+        "建议": label,
+        "幅度": f"{sign}{r['trade_pct']:.1f}%" if r["action"] in ("ADD","REENTRY","TRIM","EXIT") else "",
+        "当前%": f"{h['current_weight']:.1f}",
+        "目标%": f"{r['target_pct']:.0f}",
+        "最新价": f"{r['price']:.2f}",
+        "盈亏": f"{r['pl_pct']:+.1f}%" if r["pl_pct"] is not None else "—",
+        "趋势": TREND_CN.get(r["trend_state"], r["trend_state"]),
+        "风险": r["risk_flag"],
+        "拥挤": r["crowding"],
     })
-
-st.subheader("持仓总览与加减仓信号")
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-st.caption("信号 = 技术分 + 宏观分 × 权重。🟢🟢强烈加仓 ≥50 ｜ 🟢加仓 ≥20 ｜ 🔵持有 ｜ 🟡减仓 ｜ 🔴强烈减仓。"
-           "宏观影响小于个股；个股重大突破时下限锁定在“加仓”。")
+st.caption("建议来自三层引擎：ENV闸门 → 趋势状态 → 触发器。点下方查看每只的详细理由。")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 个股明细
+# 个股明细（含 rationale）
 # ---------------------------------------------------------------------------
 st.subheader("个股明细")
-selected = st.selectbox("选择查看", options=list(HOLDINGS.keys()),
-                        format_func=lambda t: f"{t} - {HOLDINGS[t]['name']}")
+syms = [h["symbol"] for h in HOLDINGS if h["symbol"] in results]
+if syms:
+    sel = st.selectbox("选择查看", options=syms,
+                       format_func=lambda s: f"{s} - {results[s]['name']}")
+    r = results[sel]
+    ind = r["ind"]
+    label, color = ACTION_STYLE[r["action"]]
 
-df = load_history(selected)
-if not df.empty and selected in analysis_cache:
-    res = analysis_cache[selected]
-    ind, tech, sig = res["indicators"], res["technical"], res["signal"]
-    price = quotes.get(selected, df["Close"].iloc[-1])
+    c = st.columns(5)
+    c[0].metric("建议", label, f"{r['size_hint']} {r['trade_pct']:+.1f}%" if r["action"] in ("ADD","REENTRY","TRIM","EXIT") else "")
+    c[1].metric("最新价", f"{r['price']:.2f}", f"{r['pl_pct']:+.1f}%" if r["pl_pct"] is not None else None)
+    c[2].metric("趋势", TREND_CN.get(r["trend_state"], r["trend_state"]))
+    c[3].metric("风险", r["risk_flag"])
+    c[4].metric("止损价", f"{r['stop_price']:.2f}" if r.get("stop_price") and not pd.isna(r['stop_price']) else "—")
 
-    top = st.columns(4)
-    top[0].metric("建议", sig["label"], f"综合 {sig['combined']}")
-    top[1].metric("最新价", f"${price:.2f}")
-    top[2].metric("52周高", f"${ind['high52']:.2f}", f"{ind['pct_from_high']:+.1f}%")
-    top[3].metric("RSI(14)", f"{ind['rsi']:.0f}" if not pd.isna(ind['rsi']) else "—")
+    st.markdown(f"**为什么是「{label}」：**")
+    for reason in r["rationale"]:
+        st.write("·", reason)
+    if not r["rationale"]:
+        st.write("· 无特别触发")
 
-    # 个股风险预警
-    if res["alerts"]:
-        for a in res["alerts"]:
-            msg = f"{a['tag']}：{a['detail']}"
-            if a["level"] == "high":
-                st.error(msg)
-            else:
-                st.warning(msg)
+    # 状态展开
+    with st.expander("展开：趋势 / 风险 / 指标细节"):
+        st.write("**趋势判定：**", "；".join(r["trend_reasons"]))
+        st.write("**风险判定：**", "；".join(r["risk_reasons"]) or "GREEN，无风险触发")
+        st.write(f"**关键指标：** 价 {ind['close']:.2f}｜MA50 {ind['ma50']:.2f}｜MA200 {ind['ma200']:.2f}"
+                 f"｜RSI {ind['rsi']:.0f}｜ATR {ind['atr']:.2f}｜60日回撤 {ind['dd60']*100:.0f}%"
+                 f"｜ATR%分位 {ind['atr_pct_pctile']:.0%}")
 
-    left, right = st.columns([3, 2])
-    with left:
+    df = load_history(next(h["market"] for h in HOLDINGS if h["symbol"] == sel), sel)
+    if not df.empty:
         st.line_chart(df["Close"])
-    with right:
-        st.markdown("**技术面理由：**")
-        for r in tech["reasons"]:
-            st.write("·", r)
-        if not tech["reasons"]:
-            st.write("· 暂无明显技术信号")
-        st.markdown(
-            f"**评分：** 技术 `{sig['tech_score']}` + 宏观 `{sig['macro_score']}` × "
-            f"`{analytics.MACRO_WEIGHT}` → **综合 `{sig['combined']}`**"
-        )
-        if sig["macro_overridden"]:
-            st.success("个股重大突破，已压过宏观逆风，信号锁定在“加仓”。")
 
 st.divider()
 
@@ -309,21 +284,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("📅 持仓大事件（预计时间）")
 if events.empty:
-    st.info("暂无事件数据。运行 scripts/fetch_us.py 后会自动生成财报 / 除息日。")
+    st.info("暂无事件数据。")
 else:
     ev = events.copy()
     ev["date"] = pd.to_datetime(ev["date"])
     today = pd.Timestamp.now().normalize()
-    upcoming = ev[ev["date"] >= today].sort_values("date")
-    only_holdings = st.checkbox("只看已持仓标的", value=False)
-    if only_holdings:
-        held = [t for t, h in HOLDINGS.items() if h["weight"] > 0]
-        upcoming = upcoming[upcoming["ticker"].isin(held)]
-    upcoming = upcoming.assign(
-        距今天数=(upcoming["date"] - today).dt.days,
-        日期=upcoming["date"].dt.strftime("%Y-%m-%d"),
-    )
-    show = upcoming.rename(columns={
-        "ticker": "代码", "name": "名称", "type": "类型", "detail": "说明"
-    })[["日期", "距今天数", "代码", "名称", "类型", "说明"]]
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    up = ev[ev["date"] >= today].sort_values("date")
+    up = up.assign(距今天数=(up["date"] - today).dt.days,
+                   日期=up["date"].dt.strftime("%Y-%m-%d"))
+    show = up.rename(columns={"ticker": "代码", "name": "名称", "type": "类型", "detail": "说明"})
+    cols = [c for c in ["日期", "距今天数", "代码", "名称", "类型", "说明"] if c in show.columns]
+    st.dataframe(show[cols], use_container_width=True, hide_index=True)

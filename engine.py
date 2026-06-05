@@ -218,19 +218,37 @@ def decide_action(ind, holding, trend, risk, crowding, env_info, rc, rules) -> d
         rationale += exit_reasons
         return out("EXIT", trade_pct=-cur)
 
-    # ---- TRIM ----
-    if cur > 0 and state in ("UP_TREND", "UP_PULLBACK", "DOWN_TRANSITION"):
-        trim = False
-        if flag == "AMBER":
-            trim = True; rationale.append(f"风险升至AMBER：{'/'.join(risk['reasons'][:2])}")
-        if crowding == "HIGH":
-            trim = True; rationale.append("拥挤度HIGH（涨多+放量，防回吐）")
-        if env == "PRESSURE" and holding["risk_class"] == "HIGH":
-            trim = True; rationale.append("宏观承压且高波动成长")
-        if not np.isnan(ind["vol_ratio"]) and ind["vol_ratio"] >= 2 and close < ind["open"]:
-            trim = True; rationale.append(f"放量长阴(量比{ind['vol_ratio']:.1f})")
-        if trim:
-            trim_pct = -min(cur * rc["trim_step"], cur) if "trim_step" in rc else -cur * 0.3
+    # ---- TRIM ----（关键：区分超配 / 急性风险 / 一般风险，仓位不足时不因小风险减仓）
+    if cur > 0:
+        target_max = holding["target_max_weight"]
+        trim_step = rc.get("trim_step", 0.30)
+
+        # 1) 超配：当前 > 目标上限 → 减回目标（最明确的减仓理由）
+        if cur > target_max:
+            trim_pct = -(cur - target_max)
+            if abs(trim_pct) >= g["min_trade_pct"]:
+                rationale.append(f"超配：当前{cur:.0f}% > 目标上限{target_max:.0f}%，减回目标")
+                return out("TRIM", trade_pct=trim_pct)
+
+        # 2) 急性风险事件：即便未超配也应降低暴露（需持仓有意义 ≥3%）
+        if state in ("UP_TREND", "UP_PULLBACK", "DOWN_TRANSITION") and cur >= 3:
+            acute = []
+            if crowding == "HIGH":
+                acute.append("拥挤度HIGH（涨多+放量，防回吐）")
+            if env == "PRESSURE" and holding["risk_class"] == "HIGH":
+                acute.append("宏观承压且高波动成长")
+            if not np.isnan(ind["vol_ratio"]) and ind["vol_ratio"] >= 2 and close < ind["open"]:
+                acute.append(f"放量长阴(量比{ind['vol_ratio']:.1f})")
+            if acute:
+                rationale += acute
+                trim_pct = -min(cur * trim_step, cur)
+                if abs(trim_pct) >= g["min_trade_pct"]:
+                    return out("TRIM", trade_pct=trim_pct)
+
+        # 3) 一般风险(AMBER)：仅在已接近/达到目标仓位(≥80%)时才减；否则不因小风险减低配仓位
+        if flag == "AMBER" and cur >= target_max * 0.8 and state in ("UP_TREND", "UP_PULLBACK"):
+            rationale.append(f"风险AMBER且接近目标仓位：{'/'.join(risk['reasons'][:2])}")
+            trim_pct = -min(cur * trim_step, cur)
             if abs(trim_pct) >= g["min_trade_pct"]:
                 return out("TRIM", trade_pct=trim_pct)
 
