@@ -24,6 +24,10 @@ jobs:
       - name: 拉取美股数据
         run: python scripts/fetch_us.py
 
+      - name: 拉取A股数据
+        run: python scripts/fetch_cn.py
+        continue-on-error: true   # A股源对境外IP可能403，失败不阻断美股数据提交
+
       - name: 提交数据到仓库
         run: |
           git config --global user.name 'GitHub Actions'
